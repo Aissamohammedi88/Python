@@ -1,0 +1,419 @@
+# -*- coding: utf-8 -*-
+"""td_update_plan_v2.py — TypedDict スパース更新計画器 / Nuclear Edition.
+
+設計不変条件 (design invariants)
+--------------------------------
+1. スパース意味論: ``patch`` に明示されたキーのみ上書きする。
+   省略されたキーは常に保持され、削除とは見なさない。
+2. 削除は ``deletes`` による明示操作に限る。
+3. 必須 (Required / total) および読み取り専用 (ReadOnly / Final) は削除不可。
+4. 読み取り専用は値の変更も不可。ただし現値と厳密一致する安全スカラーの
+   再代入は「無操作」として許可する。
+5. 型検証は ``type(value) is T`` の厳密比較のみ。``isinstance`` は使用しない
+   (ユーザー定義の ``__instancecheck__`` を発火させないため)。
+6. ホワイトリスト外の型は決して通過させない。
+7. 原子性: すべての検査に合格した時のみ独立した dict を返す。
+   一つでも失敗すれば ``result=None``。元レコードは決して変更しない。
+8. 継承フィールドとジェネリック束縛 (``Box[int]`` / ``class S(Box[str])``) は
+   検証前に解決する。
+9. 曖昧さは黙認せず明示的に拒否する (同一キーの削除＋変更、必須欠落など)。
+
+実行方法 (run)
+--------------
+    python -m pytest test_td_update_plan_v2.py -q
+"""
+from __future__ import annotations
+
+import dataclasses
+import functools
+import types as _types
+import typing
+from enum import Enum
+from typing import Any, Dict, FrozenSet, Iterable, Mapping, Optional, Tuple, TypeVar
+
+import typing_extensions as te
+
+__all__ = [
+    "ErrorCode",
+    "PlanError",
+    "UpdatePlan",
+    "UpdateRejected",
+    "FieldSpec",
+    "DEFAULT_SAFE_TYPES",
+    "SAFE_TYPES",
+    "plan_update",
+    "apply_or_raise",
+    "describe",
+]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 定数 / Constants
+# ═══════════════════════════════════════════════════════════════════════════
+
+#: 安全型ホワイトリスト。ここに列挙された型だけが厳密型検証の対象となる。
+#: 注意: ``bool`` と ``int`` は別型として扱う (厳密一致)。
+DEFAULT_SAFE_TYPES: FrozenSet[type] = frozenset(
+    {str, int, float, bool, bytes, type(None)}
+)
+
+#: 後方互換エイリアス。
+SAFE_TYPES: FrozenSet[type] = DEFAULT_SAFE_TYPES
+
+#: 番兵。キーの「不在」と「値が None」を区別するために使う。
+_MISSING: Any = object()
+
+# 修飾子 (qualifier) の集合。typing / typing_extensions 両対応。
+_REQUIRED_QUALIFIERS: FrozenSet[Any] = frozenset(
+    {te.Required, getattr(typing, "Required", te.Required)}
+)
+_NOT_REQUIRED_QUALIFIERS: FrozenSet[Any] = frozenset(
+    {te.NotRequired, getattr(typing, "NotRequired", te.NotRequired)}
+)
+_READONLY_QUALIFIERS: FrozenSet[Any] = frozenset(
+    {te.ReadOnly, getattr(typing, "ReadOnly", te.ReadOnly)}
+)
+_FINAL_QUALIFIERS: FrozenSet[Any] = frozenset({typing.Final, te.Final})
+
+#: 修飾子の入れ子展開における無限ループ防止上限。
+_MAX_QUALIFIER_DEPTH = 32
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# エラー表現 / Structured errors
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ErrorCode(str, Enum):
+    """機械可読なエラーコード。文字列としても振る舞う。"""
+
+    UNKNOWN_KEY = "UNKNOWN_KEY"
+    CONFLICTING_OPERATION = "CONFLICTING_OPERATION"
+    REQUIRED_DELETE = "REQUIRED_DELETE"
+    READONLY_DELETE = "READONLY_DELETE"
+    READONLY_CHANGE = "READONLY_CHANGE"
+    TYPE_MISMATCH = "TYPE_MISMATCH"
+    UNSAFE_TYPE = "UNSAFE_TYPE"
+    MISSING_REQUIRED = "MISSING_REQUIRED"
+    RECORD_UNKNOWN_KEY = "RECORD_UNKNOWN_KEY"
+
+
+@dataclasses.dataclass(frozen=True)
+class PlanError:
+    """単一の検証失敗。``code`` は機械用、``message`` は人間用。"""
+
+    code: ErrorCode
+    field: str
+    message: str
+
+    def __str__(self) -> str:  # pragma: no cover - 表示用
+        return f"[{self.code.value}] {self.field}: {self.message}"
+
+
+class UpdateRejected(Exception):
+    """``unwrap()`` が失敗プランに対して送出する例外。"""
+
+    def __init__(self, errors: Tuple[PlanError, ...]) -> None:
+        super().__init__("; ".join(str(e) for e in errors) or "update rejected")
+        self.errors = errors
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# データ構造 / Data structures
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclasses.dataclass(frozen=True)
+class FieldSpec:
+    """解決済みのフィールド仕様。修飾子は展開済み、TypeVar は束縛済み。"""
+
+    name: str
+    type: Any
+    required: bool
+    readonly: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class UpdatePlan:
+    """更新計画の結果。
+
+    ``ok`` が真のときのみ ``result`` は独立した新しい dict となる。
+    偽のとき ``result`` は必ず ``None`` であり、``errors`` が空でない。
+    """
+
+    ok: bool
+    result: Optional[Dict[str, Any]]
+    errors: Tuple[PlanError, ...]
+
+    @property
+    def messages(self) -> Tuple[str, ...]:
+        """人間可読メッセージのタプル。"""
+        return tuple(str(e) for e in self.errors)
+
+    @property
+    def codes(self) -> Tuple[str, ...]:
+        """エラーコード文字列のタプル。"""
+        return tuple(e.code.value for e in self.errors)
+
+    def unwrap(self) -> Dict[str, Any]:
+        """成功なら結果を返し、失敗なら ``UpdateRejected`` を送出する。"""
+        if not self.ok or self.result is None:
+            raise UpdateRejected(self.errors)
+        return self.result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 型解決 / Type resolution
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _substitute(hint: Any, bindings: Mapping[Any, Any]) -> Any:
+    """``hint`` 内の TypeVar を ``bindings`` に従って再帰的に置換する。
+
+    入れ子ジェネリック (``Box[list[T]]`` 等) にも対応する。
+    置換不要なら同一オブジェクトをそのまま返す (アイデンティティ保持)。
+    """
+    if isinstance(hint, TypeVar):
+        return bindings.get(hint, hint)
+
+    args = te.get_args(hint)
+    if not args:
+        return hint
+
+    new_args = tuple(_substitute(a, bindings) for a in args)
+    if new_args == args:
+        return hint
+
+    origin = te.get_origin(hint)
+    if origin is typing.Union or origin is _types.UnionType:
+        return typing.Union[new_args]
+
+    copy_with = getattr(hint, "copy_with", None)
+    if copy_with is not None:
+        try:
+            return copy_with(new_args)
+        except Exception:
+            pass
+
+    try:
+        return origin[new_args]
+    except Exception:
+        return hint
+
+
+def _collect_bindings(
+    td: Any, bindings: Dict[Any, Any], _seen: Optional[set] = None
+) -> None:
+    """``__orig_bases__`` を辿り TypeVar → 実型 の束縛を収集する。
+
+    外側の束縛が優先される (``setdefault`` 相当)。循環参照は ``_seen`` で遮断。
+    """
+    if _seen is None:
+        _seen = set()
+
+    marker = id(td)
+    if marker in _seen:
+        return
+    _seen.add(marker)
+
+    origin = te.get_origin(td)
+    if origin is not None:
+        params = getattr(origin, "__parameters__", ())
+        for param, arg in zip(params, te.get_args(td)):
+            if param not in bindings:
+                bindings[param] = _substitute(arg, bindings)
+        td = origin
+
+    for base in getattr(td, "__orig_bases__", ()):
+        _collect_bindings(base, bindings, _seen)
+
+
+def _resolve_field_hint(
+    hint: Any, base_required: bool
+) -> Tuple[Any, bool, bool]:
+    """修飾子を展開し ``(解決済みヒント, 必須か, 読み取り専用か)`` を返す。
+
+    対応する修飾子: ``Annotated`` / ``Required`` / ``NotRequired`` /
+    ``ReadOnly`` / ``Final``。入れ子も展開する。
+    """
+    required = base_required
+    readonly = False
+
+    for _ in range(_MAX_QUALIFIER_DEPTH):
+        # Annotated[...] は __metadata__ の有無で判定する
+        # (get_origin は内側の型を返すため判別に使えない)
+        if getattr(hint, "__metadata__", None) is not None:
+            inner = te.get_args(hint)
+            if not inner:
+                break
+            hint = inner[0]
+            continue
+
+        origin = te.get_origin(hint)
+        if origin is None:
+            break
+
+        if origin in _READONLY_QUALIFIERS or origin in _FINAL_QUALIFIERS:
+            readonly = True
+            inner = te.get_args(hint)
+            if not inner:
+                break
+            hint = inner[0]
+            continue
+
+        if origin in _REQUIRED_QUALIFIERS:
+            required = True
+            inner = te.get_args(hint)
+            if not inner:
+                break
+            hint = inner[0]
+            continue
+
+        if origin in _NOT_REQUIRED_QUALIFIERS:
+            required = False
+            inner = te.get_args(hint)
+            if not inner:
+                break
+            hint = inner[0]
+            continue
+
+        break
+
+    return hint, required, readonly
+
+
+@functools.lru_cache(maxsize=256)
+def _field_specs_cached(td: Any) -> Tuple[Tuple[str, FieldSpec], ...]:
+    """フィールド仕様を算出しキャッシュする (ハッシュ可能な TypedDict 前提)。"""
+    cls = te.get_origin(td) or td
+
+    bindings: Dict[Any, Any] = {}
+    _collect_bindings(td, bindings)
+
+    hints = typing.get_type_hints(cls, include_extras=True)
+    required_keys = set(getattr(cls, "__required_keys__", ()))
+
+    specs = []
+    for name, hint in hints.items():
+        resolved, required, readonly = _resolve_field_hint(
+            hint, name in required_keys
+        )
+        resolved = _substitute(resolved, bindings)
+        specs.append(
+            (
+                name,
+                FieldSpec(
+                    name=name,
+                    type=resolved,
+                    required=required,
+                    readonly=readonly,
+                ),
+            )
+        )
+    return tuple(specs)
+
+
+def _field_specs(td: Any) -> Dict[str, FieldSpec]:
+    """キャッシュ層の薄いラッパ。ハッシュ不能な入力では非キャッシュ経路へ退避。"""
+    try:
+        pairs = _field_specs_cached(td)
+    except TypeError:
+        pairs = _field_specs_cached.__wrapped__(td)
+    return dict(pairs)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 値検証 / Value validation
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _check_value(
+    expected: Any, value: Any, safe_types: FrozenSet[type]
+) -> Optional[Tuple[ErrorCode, str]]:
+    """``None`` を返せば合格。それ以外は ``(コード, メッセージ)``。
+
+    未知型は決して合格させない (フェイルクローズド)。
+    """
+    if isinstance(expected, type) and expected in safe_types:
+        if type(value) is expected:
+            return None
+        return (
+            ErrorCode.TYPE_MISMATCH,
+            f"厳密型が一致しません: 期待 {expected.__name__} / "
+            f"実際 {type(value).__name__}",
+        )
+    return (
+        ErrorCode.UNSAFE_TYPE,
+        f"宣言型 {expected!r} は安全型ホワイトリスト外のため検証できません",
+    )
+
+
+def _normalize_deletes(deletes: Iterable[str]) -> Tuple[str, ...]:
+    """削除キーを正規化する。文字列の誤渡しを 1 要素として扱い、重複を除去。"""
+    if isinstance(deletes, str):
+        deletes = (deletes,)
+    return tuple(dict.fromkeys(deletes))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 公開 API / Public API
+# ═══════════════════════════════════════════════════════════════════════════
+
+def plan_update(
+    td: Any,
+    record: Mapping[str, Any],
+    patch: Optional[Mapping[str, Any]] = None,
+    deletes: Iterable[str] = (),
+    *,
+    safe_types: FrozenSet[type] = DEFAULT_SAFE_TYPES,
+    require_complete: bool = True,
+    reject_unknown_record_keys: bool = False,
+    validate_record_values: bool = False,
+) -> UpdatePlan:
+    """``record`` にスパース ``patch`` と明示 ``deletes`` を適用した計画を返す。
+
+    引数
+    ----
+    td : TypedDict クラス、または ``Box[int]`` のようなパラメータ化エイリアス。
+    record : 元レコード。決して変更しない。
+    patch : スパース変更。省略キーは保持される。
+    deletes : 明示削除キー。必須・読み取り専用は削除不可。
+    safe_types : 厳密型検証を許可する型のホワイトリスト。
+    require_complete : 真なら、必須フィールドが最終結果に揃っていることを検査する。
+    reject_unknown_record_keys : 真なら、元レコードの未知キーを報告する。
+    validate_record_values : 真なら、元レコードの既存値も型検証する。
+
+    戻り値
+    ------
+    UpdatePlan : 全検査合格時のみ ``result`` に独立した dict を持つ。
+    """
+    patch_map: Dict[str, Any] = {} if patch is None else dict(patch)
+    delete_list = _normalize_deletes(deletes)
+    specs = _field_specs(td)
+
+    errors: list = []
+
+    def add(code: ErrorCode, field: str, message: str) -> None:
+        errors.append(PlanError(code=code, field=field, message=message))
+
+    # ── 事前検査: 未知キー ────────────────────────────────────────────
+    for key in sorted(set(patch_map) | set(delete_list)):
+        if key not in specs:
+            add(ErrorCode.UNKNOWN_KEY, str(key), "TypedDict に定義されていないキーです")
+
+    # ── 事前検査: 矛盾する操作 ────────────────────────────────────────
+    for key in sorted(set(patch_map) & set(delete_list)):
+        add(
+            ErrorCode.CONFLICTING_OPERATION,
+            key,
+            "同一キーに対して削除と変更が同時に指定されています",
+        )
+
+    # ── 事前検査: 元レコードの未知キー (任意) ─────────────────────────
+    if reject_unknown_record_keys:
+        for key in sorted(set(record) - set(specs)):
+            add(
+                ErrorCode.RECORD_UNKNOWN_KEY,
+                str(key),
+                "元レコードに TypedDict 外のキーが含まれています",
+            )
+
+    result: Dict[str, Any] = dict(record)  # 独立コピー。元レコードは不変。
+
+    # ── 1) 明示削除 ──────────────────────────────────────────────────
+    for key in
